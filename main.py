@@ -12,7 +12,7 @@ from PyQt5.QtWidgets import (
     QMenu, QAction, QMessageBox, QGroupBox, QKeySequenceEdit,
     QTextEdit
 )
-from PyQt5.QtCore import Qt, QRect, pyqtSignal, QPoint, QTimer
+from PyQt5.QtCore import Qt, QRect, pyqtSignal, QPoint, QTimer, QByteArray, QBuffer, QIODevice
 from PyQt5.QtGui import (
     QIcon, QPixmap, QPainter, QColor, QFont, QKeySequence,
     QPen, QBrush, QScreen, QCursor
@@ -33,7 +33,7 @@ DEFAULT_CONFIG = {
     "hotkey": "ctrl+shift+s",
     "autostart": False,
     "model": "meta-llama/llama-4-scout-17b-16e-instruct",
-    "prompt": "Describe what you see in this image. Answer in the same language as any text visible in the image. Be concise."
+    "prompt": "Look at this image. If it contains a question, task, exercise, or problem — solve it and give the answer. If it contains text in a specific language, answer in that same language. Be concise and direct — give the answer, not a description of the image."
 }
 
 
@@ -182,9 +182,9 @@ class ResultOverlay(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowFlags(
-            Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
+            Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
         )
-        self.setAttribute(Qt.WA_TranslucentBackground, False)
+        self.setFocusPolicy(Qt.StrongFocus)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -193,7 +193,7 @@ class ResultOverlay(QWidget):
         self._text.setReadOnly(True)
         self._text.setStyleSheet("""
             QTextEdit {
-                background-color: rgba(30, 30, 30, 240);
+                background-color: #1e1e1e;
                 color: #e0e0e0;
                 border: 2px solid #0096ff;
                 border-radius: 6px;
@@ -204,27 +204,54 @@ class ResultOverlay(QWidget):
         """)
         layout.addWidget(self._text)
 
+        self._esc_hook = None
+
+    def _hook_escape(self):
+        self._unhook_escape()
+        self._esc_hook = keyboard.on_press_key("esc", lambda _: QTimer.singleShot(0, self._close_overlay), suppress=False)
+
+    def _unhook_escape(self):
+        if self._esc_hook is not None:
+            keyboard.unhook(self._esc_hook)
+            self._esc_hook = None
+
+    def _close_overlay(self):
+        self._unhook_escape()
+        self.hide()
+        self.closed.emit()
+
     def show_result(self, rect: QRect, text: str):
-        self.setGeometry(rect)
+        min_w, min_h = 300, 150
+        r = QRect(rect)
+        if r.width() < min_w:
+            r.setWidth(min_w)
+        if r.height() < min_h:
+            r.setHeight(min_h)
+        self.setGeometry(r)
         self._text.setText(text)
         self.show()
         self.activateWindow()
         self.raise_()
+        self._hook_escape()
 
     def show_loading(self, rect: QRect):
-        self.setGeometry(rect)
-        self._text.setText("⏳ Analyzing...")
+        min_w, min_h = 300, 100
+        r = QRect(rect)
+        if r.width() < min_w:
+            r.setWidth(min_w)
+        if r.height() < min_h:
+            r.setHeight(min_h)
+        self.setGeometry(r)
+        self._text.setText("Analyzing...")
         self._text.setAlignment(Qt.AlignCenter)
         self.show()
         self.activateWindow()
+        self.raise_()
+        self._hook_escape()
 
-    def keyPressEvent(self, event):
-        if event.key() == Qt.Key_Escape:
-            self.hide()
-            self.closed.emit()
-
-    def focusOutEvent(self, event):
-        pass
+    def hideEvent(self, event):
+        self._unhook_escape()
+        super().hideEvent(event)
 
 
 # ── Settings window ───────────────────────────────────────────────
@@ -363,6 +390,7 @@ class SettingsWindow(QMainWindow):
 
 class AIAnswerApp(QApplication):
     trigger_screenshot = pyqtSignal()
+    _groq_result = pyqtSignal(QRect, str)
 
     def __init__(self, argv):
         super().__init__(argv)
@@ -383,6 +411,7 @@ class AIAnswerApp(QApplication):
         self._result.closed.connect(self._on_result_closed)
 
         self.trigger_screenshot.connect(self._start_screenshot)
+        self._groq_result.connect(self._on_groq_result)
 
         self._setup_tray()
         self._register_hotkey(self.config.get("hotkey", DEFAULT_CONFIG["hotkey"]))
@@ -455,10 +484,16 @@ class AIAnswerApp(QApplication):
     def _on_area_selected(self, rect: QRect, pixmap: QPixmap):
         self._result.show_loading(rect)
 
-        buf = io.BytesIO()
-        pixmap.save(buf, "PNG")
-        img_bytes = buf.getvalue()
-        b64 = base64.b64encode(img_bytes).decode("utf-8")
+        ba = QByteArray()
+        buffer = QBuffer(ba)
+        buffer.open(QIODevice.WriteOnly)
+        pixmap.save(buffer, "PNG")
+        buffer.close()
+        b64 = base64.b64encode(ba.data()).decode("utf-8")
+
+        if not b64:
+            self._result.show_result(rect, "Error: Failed to capture screenshot")
+            return
 
         thread = threading.Thread(
             target=self._call_groq, args=(rect, b64), daemon=True
@@ -467,7 +502,11 @@ class AIAnswerApp(QApplication):
 
     def _call_groq(self, rect, b64_image):
         try:
-            client = Groq(api_key=self.config.get("api_key", ""))
+            api_key = self.config.get("api_key", "")
+            if not api_key:
+                self._groq_result.emit(rect, "Error: API key not set. Open Settings and enter your Groq API key.")
+                return
+            client = Groq(api_key=api_key, timeout=30.0)
             completion = client.chat.completions.create(
                 model=self.config.get("model", DEFAULT_CONFIG["model"]),
                 messages=[
@@ -494,7 +533,10 @@ class AIAnswerApp(QApplication):
         except Exception as e:
             answer = f"Error: {e}"
 
-        QTimer.singleShot(0, lambda: self._result.show_result(rect, answer))
+        self._groq_result.emit(rect, answer)
+
+    def _on_groq_result(self, rect, text):
+        self._result.show_result(rect, text)
 
     def _on_cancelled(self):
         pass
