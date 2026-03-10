@@ -5,17 +5,21 @@ import base64
 import io
 import threading
 import winreg
+import ctypes
+import ctypes.wintypes
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QCheckBox, QSystemTrayIcon,
     QMenu, QAction, QMessageBox, QGroupBox, QKeySequenceEdit,
-    QTextEdit
+    QTextEdit, QGraphicsDropShadowEffect, QSpacerItem, QSizePolicy,
+    QFrame
 )
-from PyQt5.QtCore import Qt, QRect, pyqtSignal, QPoint, QTimer, QByteArray, QBuffer, QIODevice
+from PyQt5.QtCore import Qt, QRect, pyqtSignal, QPoint, QTimer, QByteArray, QBuffer, QIODevice, QSize
 from PyQt5.QtGui import (
     QIcon, QPixmap, QPainter, QColor, QFont, QKeySequence,
-    QPen, QBrush, QScreen, QCursor
+    QPen, QBrush, QScreen, QCursor, QLinearGradient, QPainterPath,
+    QFontDatabase
 )
 
 import keyboard
@@ -33,9 +37,57 @@ DEFAULT_CONFIG = {
     "hotkey": "ctrl+shift+s",
     "autostart": False,
     "model": "meta-llama/llama-4-scout-17b-16e-instruct",
-    "prompt": "Look at this image. If it contains a question, task, exercise, or problem — solve it and give the answer. If it contains text in a specific language, answer in that same language. Be concise and direct — give the answer, not a description of the image."
+    "prompt": "You are a solver. Look at the image and give ONLY the answer. Do NOT describe the image. If there are math problems — solve them and write the answers. If there is a question — answer it. If there is a task or exercise — complete it. Reply in the language of the text on the image. Be short."
 }
 
+# ── Windows Acrylic Blur ──────────────────────────────────────────
+
+class ACCENT_POLICY(ctypes.Structure):
+    _fields_ = [
+        ("AccentState", ctypes.c_int),
+        ("AccentFlags", ctypes.c_int),
+        ("GradientColor", ctypes.c_uint),
+        ("AnimationId", ctypes.c_int),
+    ]
+
+class WINDOWCOMPOSITIONATTRIBDATA(ctypes.Structure):
+    _fields_ = [
+        ("Attribute", ctypes.c_int),
+        ("Data", ctypes.POINTER(ACCENT_POLICY)),
+        ("SizeOfData", ctypes.c_size_t),
+    ]
+
+def enable_acrylic(hwnd, color=0xCC1a1a2e):
+    """Enable Windows acrylic blur behind a window. color = AABBGGRR"""
+    accent = ACCENT_POLICY()
+    accent.AccentState = 4  # ACCENT_ENABLE_ACRYLICBLURBEHIND
+    accent.AccentFlags = 2
+    accent.GradientColor = color
+    data = WINDOWCOMPOSITIONATTRIBDATA()
+    data.Attribute = 19  # WCA_ACCENT_POLICY
+    data.Data = ctypes.pointer(accent)
+    data.SizeOfData = ctypes.sizeof(accent)
+    try:
+        ctypes.windll.user32.SetWindowCompositionAttribute(
+            ctypes.wintypes.HWND(hwnd), ctypes.pointer(data)
+        )
+    except Exception:
+        pass
+
+
+def enable_mica(hwnd):
+    """Enable Mica effect on Windows 11."""
+    try:
+        value = ctypes.c_int(1)
+        ctypes.windll.dwmapi.DwmSetWindowAttribute(
+            ctypes.wintypes.HWND(hwnd), 38,
+            ctypes.byref(value), ctypes.sizeof(value)
+        )
+    except Exception:
+        pass
+
+
+# ── Config ────────────────────────────────────────────────────────
 
 def load_config():
     os.makedirs(CONFIG_DIR, exist_ok=True)
@@ -124,23 +176,55 @@ class ScreenshotOverlay(QWidget):
         if self._screenshot:
             painter.drawPixmap(0, 0, self._screenshot)
 
+        # dim overlay
         painter.setBrush(QColor(0, 0, 0, 100))
         painter.setPen(Qt.NoPen)
         painter.drawRect(self.rect())
 
         if self._selecting and not self._origin.isNull():
             rect = QRect(self._origin, self._current).normalized()
+
+            # clear selected area
             painter.setCompositionMode(QPainter.CompositionMode_Clear)
             painter.fillRect(rect, Qt.transparent)
             painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
 
+            # draw screenshot in selected area
             if self._screenshot:
                 painter.drawPixmap(rect, self._screenshot, rect)
 
-            pen = QPen(QColor(0, 150, 255), 2, Qt.SolidLine)
+            # selection border with glow
+            pen = QPen(QColor(100, 180, 255), 2, Qt.SolidLine)
             painter.setPen(pen)
             painter.setBrush(Qt.NoBrush)
             painter.drawRect(rect)
+
+            # corner handles
+            handle = 6
+            painter.setBrush(QColor(100, 180, 255))
+            painter.setPen(Qt.NoPen)
+            corners = [
+                rect.topLeft(), rect.topRight() + QPoint(-handle, 0),
+                rect.bottomLeft() + QPoint(0, -handle), rect.bottomRight() + QPoint(-handle, -handle)
+            ]
+            for c in corners:
+                painter.drawRect(QRect(c, QSize(handle, handle)))
+
+            # size label
+            label = f"{rect.width()} x {rect.height()}"
+            font = QFont("Segoe UI", 10)
+            painter.setFont(font)
+            lx = rect.left() + 4
+            ly = rect.top() - 8
+            if ly < 20:
+                ly = rect.top() + 20
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(0, 0, 0, 160))
+            fm = painter.fontMetrics()
+            tw = fm.horizontalAdvance(label) + 12
+            painter.drawRoundedRect(lx - 2, ly - fm.height(), tw, fm.height() + 4, 4, 4)
+            painter.setPen(QColor(200, 220, 255))
+            painter.drawText(lx + 4, ly - 2, label)
 
         painter.end()
 
@@ -173,10 +257,10 @@ class ScreenshotOverlay(QWidget):
             self.cancelled.emit()
 
 
-# ── Result overlay ─────────────────────────────────────────────────
+# ── Result overlay (frosted glass) ────────────────────────────────
 
 class ResultOverlay(QWidget):
-    """Shows the AI response text in the selected screen region."""
+    """Shows the AI response in a frosted glass overlay."""
     closed = pyqtSignal()
 
     def __init__(self):
@@ -184,6 +268,7 @@ class ResultOverlay(QWidget):
         self.setWindowFlags(
             Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
         )
+        self.setAttribute(Qt.WA_TranslucentBackground)
         self.setFocusPolicy(Qt.StrongFocus)
 
         layout = QVBoxLayout(self)
@@ -193,18 +278,67 @@ class ResultOverlay(QWidget):
         self._text.setReadOnly(True)
         self._text.setStyleSheet("""
             QTextEdit {
-                background-color: #1e1e1e;
-                color: #e0e0e0;
-                border: 2px solid #0096ff;
-                border-radius: 6px;
-                padding: 10px;
+                background-color: transparent;
+                color: #ffffff;
+                border: none;
+                padding: 16px;
                 font-size: 14px;
                 font-family: 'Segoe UI', sans-serif;
+                selection-background-color: rgba(100, 180, 255, 100);
+            }
+            QScrollBar:vertical {
+                background: transparent;
+                width: 6px;
+                margin: 4px 2px;
+            }
+            QScrollBar::handle:vertical {
+                background: rgba(255, 255, 255, 60);
+                border-radius: 3px;
+                min-height: 20px;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0;
             }
         """)
         layout.addWidget(self._text)
 
         self._esc_hook = None
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        # fallback glass background
+        path = QPainterPath()
+        path.addRoundedRect(0, 0, self.width(), self.height(), 12, 12)
+        painter.setClipPath(path)
+
+        painter.setBrush(QColor(20, 20, 35, 180))
+        painter.setPen(Qt.NoPen)
+        painter.drawRoundedRect(self.rect(), 12, 12)
+
+        # subtle border
+        pen = QPen(QColor(255, 255, 255, 40), 1)
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRoundedRect(1, 1, self.width() - 2, self.height() - 2, 12, 12)
+
+        # top highlight line
+        grad = QLinearGradient(0, 0, self.width(), 0)
+        grad.setColorAt(0, QColor(255, 255, 255, 0))
+        grad.setColorAt(0.5, QColor(255, 255, 255, 30))
+        grad.setColorAt(1, QColor(255, 255, 255, 0))
+        painter.setPen(QPen(QBrush(grad), 1))
+        painter.drawLine(20, 1, self.width() - 20, 1)
+
+        painter.end()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # enable acrylic blur via Windows API
+        hwnd = int(self.winId())
+        # AABBGGRR: semi-transparent dark blue-ish
+        enable_acrylic(hwnd, 0xB01a1a2e)
 
     def _hook_escape(self):
         self._unhook_escape()
@@ -221,7 +355,7 @@ class ResultOverlay(QWidget):
         self.closed.emit()
 
     def show_result(self, rect: QRect, text: str):
-        min_w, min_h = 300, 150
+        min_w, min_h = 320, 120
         r = QRect(rect)
         if r.width() < min_w:
             r.setWidth(min_w)
@@ -235,15 +369,15 @@ class ResultOverlay(QWidget):
         self._hook_escape()
 
     def show_loading(self, rect: QRect):
-        min_w, min_h = 300, 100
+        min_w, min_h = 260, 80
         r = QRect(rect)
         if r.width() < min_w:
             r.setWidth(min_w)
         if r.height() < min_h:
             r.setHeight(min_h)
         self.setGeometry(r)
-        self._text.setText("Analyzing...")
         self._text.setAlignment(Qt.AlignCenter)
+        self._text.setText("Analyzing...")
         self.show()
         self.activateWindow()
         self.raise_()
@@ -256,6 +390,145 @@ class ResultOverlay(QWidget):
 
 # ── Settings window ───────────────────────────────────────────────
 
+SETTINGS_STYLE = """
+QMainWindow {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+        stop:0 #0d0d1a, stop:0.5 #141428, stop:1 #0d0d1a);
+}
+
+QLabel {
+    color: rgba(255, 255, 255, 0.7);
+    font-size: 12px;
+    font-family: 'Segoe UI', sans-serif;
+}
+
+QLabel#title {
+    color: #ffffff;
+    font-size: 22px;
+    font-weight: bold;
+    font-family: 'Segoe UI', sans-serif;
+}
+
+QLabel#subtitle {
+    color: rgba(255, 255, 255, 0.4);
+    font-size: 12px;
+    font-family: 'Segoe UI', sans-serif;
+}
+
+QLineEdit {
+    background-color: rgba(255, 255, 255, 0.06);
+    color: #e0e0e0;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 8px;
+    padding: 10px 14px;
+    font-size: 13px;
+    font-family: 'Segoe UI', sans-serif;
+    selection-background-color: rgba(100, 140, 255, 0.4);
+}
+QLineEdit:focus {
+    border: 1px solid rgba(100, 140, 255, 0.5);
+    background-color: rgba(255, 255, 255, 0.08);
+}
+QLineEdit:hover {
+    background-color: rgba(255, 255, 255, 0.08);
+}
+
+QTextEdit {
+    background-color: rgba(255, 255, 255, 0.06);
+    color: #e0e0e0;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 8px;
+    padding: 10px 14px;
+    font-size: 13px;
+    font-family: 'Segoe UI', sans-serif;
+    selection-background-color: rgba(100, 140, 255, 0.4);
+}
+QTextEdit:focus {
+    border: 1px solid rgba(100, 140, 255, 0.5);
+    background-color: rgba(255, 255, 255, 0.08);
+}
+
+QCheckBox {
+    color: rgba(255, 255, 255, 0.8);
+    spacing: 10px;
+    font-size: 13px;
+    font-family: 'Segoe UI', sans-serif;
+}
+QCheckBox::indicator {
+    width: 20px; height: 20px;
+    border: 2px solid rgba(255, 255, 255, 0.2);
+    border-radius: 6px;
+    background: rgba(255, 255, 255, 0.05);
+}
+QCheckBox::indicator:hover {
+    border-color: rgba(100, 140, 255, 0.5);
+    background: rgba(100, 140, 255, 0.1);
+}
+QCheckBox::indicator:checked {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+        stop:0 #667eea, stop:1 #764ba2);
+    border-color: transparent;
+    image: none;
+}
+
+QPushButton#save_btn {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 #667eea, stop:1 #764ba2);
+    color: white;
+    border: none;
+    border-radius: 10px;
+    padding: 12px 32px;
+    font-weight: 600;
+    font-size: 14px;
+    font-family: 'Segoe UI', sans-serif;
+}
+QPushButton#save_btn:hover {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 #7b8ef8, stop:1 #8b5fbf);
+}
+QPushButton#save_btn:pressed {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 #5a6fd6, stop:1 #6a3f92);
+}
+
+QFrame#separator {
+    background: rgba(255, 255, 255, 0.06);
+    max-height: 1px;
+}
+
+QFrame#card {
+    background-color: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 12px;
+}
+"""
+
+TRAY_MENU_STYLE = """
+QMenu {
+    background-color: #1a1a2e;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 8px;
+    padding: 6px;
+    font-family: 'Segoe UI', sans-serif;
+}
+QMenu::item {
+    color: rgba(255, 255, 255, 0.8);
+    padding: 8px 24px 8px 12px;
+    border-radius: 6px;
+    font-size: 13px;
+}
+QMenu::item:selected {
+    background: rgba(100, 140, 255, 0.2);
+    color: #ffffff;
+}
+QMenu::separator {
+    height: 1px;
+    background: rgba(255, 255, 255, 0.08);
+    margin: 4px 8px;
+}
+"""
+
+
 class SettingsWindow(QMainWindow):
     hotkey_changed = pyqtSignal(str)
     config_saved = pyqtSignal(dict)
@@ -263,105 +536,96 @@ class SettingsWindow(QMainWindow):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.setWindowTitle(f"{APP_NAME} — Settings")
-        self.setFixedSize(500, 420)
+        self.setWindowTitle(f"{APP_NAME}")
+        self.setFixedSize(480, 520)
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowMaximizeButtonHint)
+        self.setStyleSheet(SETTINGS_STYLE)
 
         central = QWidget()
         self.setCentralWidget(central)
         main_layout = QVBoxLayout(central)
-        main_layout.setSpacing(12)
+        main_layout.setSpacing(6)
+        main_layout.setContentsMargins(28, 24, 28, 24)
 
-        # ── API group ──
-        api_group = QGroupBox("API")
-        api_layout = QVBoxLayout()
-        api_layout.addWidget(QLabel("Groq API Key:"))
+        # ── Header ──
+        title = QLabel("AI Answer")
+        title.setObjectName("title")
+        main_layout.addWidget(title)
+
+        subtitle = QLabel("Screenshot to AI-powered answer")
+        subtitle.setObjectName("subtitle")
+        main_layout.addWidget(subtitle)
+
+        main_layout.addSpacing(16)
+
+        # ── API Key ──
+        main_layout.addWidget(self._section_label("API KEY"))
         self.api_key_input = QLineEdit(self.config.get("api_key", ""))
         self.api_key_input.setEchoMode(QLineEdit.Password)
-        api_layout.addWidget(self.api_key_input)
+        self.api_key_input.setPlaceholderText("gsk_...")
+        main_layout.addWidget(self.api_key_input)
 
-        api_layout.addWidget(QLabel("Model:"))
+        main_layout.addSpacing(10)
+
+        # ── Model ──
+        main_layout.addWidget(self._section_label("MODEL"))
         self.model_input = QLineEdit(self.config.get("model", DEFAULT_CONFIG["model"]))
-        api_layout.addWidget(self.model_input)
+        self.model_input.setPlaceholderText("meta-llama/llama-4-scout-17b-16e-instruct")
+        main_layout.addWidget(self.model_input)
 
-        api_layout.addWidget(QLabel("System prompt:"))
+        main_layout.addSpacing(10)
+
+        # ── Prompt ──
+        main_layout.addWidget(self._section_label("PROMPT"))
         self.prompt_input = QTextEdit()
-        self.prompt_input.setMaximumHeight(60)
+        self.prompt_input.setFixedHeight(64)
         self.prompt_input.setText(self.config.get("prompt", DEFAULT_CONFIG["prompt"]))
-        api_layout.addWidget(self.prompt_input)
+        main_layout.addWidget(self.prompt_input)
 
-        api_group.setLayout(api_layout)
-        main_layout.addWidget(api_group)
+        main_layout.addSpacing(10)
 
-        # ── Hotkey group ──
-        hk_group = QGroupBox("Hotkey")
-        hk_layout = QHBoxLayout()
-        hk_layout.addWidget(QLabel("Screenshot hotkey:"))
+        # ── Hotkey ──
+        main_layout.addWidget(self._section_label("HOTKEY"))
         self.hotkey_input = QLineEdit(self.config.get("hotkey", DEFAULT_CONFIG["hotkey"]))
-        hk_layout.addWidget(self.hotkey_input)
-        hk_group.setLayout(hk_layout)
-        main_layout.addWidget(hk_group)
+        self.hotkey_input.setPlaceholderText("ctrl+shift+s")
+        main_layout.addWidget(self.hotkey_input)
+
+        main_layout.addSpacing(12)
+
+        # ── Separator ──
+        sep = QFrame()
+        sep.setObjectName("separator")
+        sep.setFrameShape(QFrame.HLine)
+        main_layout.addWidget(sep)
+
+        main_layout.addSpacing(8)
 
         # ── Autostart ──
-        self.autostart_cb = QCheckBox("Launch on Windows startup")
+        self.autostart_cb = QCheckBox("  Launch on Windows startup")
         self.autostart_cb.setChecked(self.config.get("autostart", False))
         main_layout.addWidget(self.autostart_cb)
 
-        # ── Buttons ──
-        btn_layout = QHBoxLayout()
+        main_layout.addStretch()
+
+        # ── Save button ──
         save_btn = QPushButton("Save")
-        save_btn.setFixedHeight(36)
+        save_btn.setObjectName("save_btn")
+        save_btn.setFixedHeight(44)
+        save_btn.setCursor(Qt.PointingHandCursor)
         save_btn.clicked.connect(self._save)
-        btn_layout.addWidget(save_btn)
-        main_layout.addLayout(btn_layout)
+        main_layout.addWidget(save_btn)
 
-        self._apply_style()
-
-    def _apply_style(self):
-        self.setStyleSheet("""
-            QMainWindow { background-color: #1e1e1e; }
-            QGroupBox {
-                color: #cccccc;
-                border: 1px solid #444;
-                border-radius: 6px;
-                margin-top: 10px;
-                padding-top: 14px;
-                font-weight: bold;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 12px;
-                padding: 0 6px;
-            }
-            QLabel { color: #bbbbbb; }
-            QLineEdit, QTextEdit {
-                background-color: #2d2d2d;
-                color: #e0e0e0;
-                border: 1px solid #555;
-                border-radius: 4px;
-                padding: 6px;
-            }
-            QCheckBox { color: #bbbbbb; spacing: 8px; }
-            QCheckBox::indicator {
-                width: 18px; height: 18px;
-                border: 1px solid #555;
-                border-radius: 3px;
-                background: #2d2d2d;
-            }
-            QCheckBox::indicator:checked {
-                background: #0096ff;
-                border-color: #0096ff;
-            }
-            QPushButton {
-                background-color: #0096ff;
-                color: white;
-                border: none;
-                border-radius: 4px;
-                padding: 8px 20px;
-                font-weight: bold;
-            }
-            QPushButton:hover { background-color: #0078d4; }
+    def _section_label(self, text):
+        lbl = QLabel(text)
+        lbl.setStyleSheet("""
+            color: rgba(255, 255, 255, 0.35);
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: 1.5px;
+            font-family: 'Segoe UI', sans-serif;
+            margin-bottom: 2px;
         """)
+        return lbl
 
     def _save(self):
         self.config["api_key"] = self.api_key_input.text().strip()
@@ -422,17 +686,19 @@ class AIAnswerApp(QApplication):
         self._tray.setToolTip(APP_NAME)
 
         menu = QMenu()
-        action_screenshot = QAction("Take Screenshot", menu)
+        menu.setStyleSheet(TRAY_MENU_STYLE)
+
+        action_screenshot = QAction("  Screenshot", menu)
         action_screenshot.triggered.connect(self._start_screenshot)
         menu.addAction(action_screenshot)
 
-        action_settings = QAction("Settings", menu)
+        action_settings = QAction("  Settings", menu)
         action_settings.triggered.connect(self._show_settings)
         menu.addAction(action_settings)
 
         menu.addSeparator()
 
-        action_quit = QAction("Quit", menu)
+        action_quit = QAction("  Quit", menu)
         action_quit.triggered.connect(self._quit)
         menu.addAction(action_quit)
 
@@ -445,11 +711,17 @@ class AIAnswerApp(QApplication):
         pixmap.fill(Qt.transparent)
         painter = QPainter(pixmap)
         painter.setRenderHint(QPainter.Antialiasing)
-        painter.setBrush(QColor(0, 150, 255))
+
+        # gradient background
+        grad = QLinearGradient(0, 0, 64, 64)
+        grad.setColorAt(0, QColor(102, 126, 234))
+        grad.setColorAt(1, QColor(118, 75, 162))
+        painter.setBrush(QBrush(grad))
         painter.setPen(Qt.NoPen)
-        painter.drawRoundedRect(4, 4, 56, 56, 12, 12)
+        painter.drawRoundedRect(4, 4, 56, 56, 14, 14)
+
         painter.setPen(QColor(255, 255, 255))
-        font = QFont("Segoe UI", 28, QFont.Bold)
+        font = QFont("Segoe UI", 22, QFont.Bold)
         painter.setFont(font)
         painter.drawText(pixmap.rect(), Qt.AlignCenter, "AI")
         painter.end()
