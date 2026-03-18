@@ -25,7 +25,7 @@ from PyQt5.QtGui import (
 import keyboard
 import mss
 from PIL import Image
-from groq import Groq
+from openai import OpenAI
 
 
 APP_NAME = "AI Answer"
@@ -33,10 +33,11 @@ CONFIG_DIR = os.path.join(os.environ.get("APPDATA", ""), APP_NAME)
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 
 DEFAULT_CONFIG = {
-    "api_key": "",
+    "api_key": "ollama",
+    "base_url": "http://localhost:11434/v1",
     "hotkey": "ctrl+shift+s",
     "autostart": False,
-    "model": "meta-llama/llama-4-scout-17b-16e-instruct",
+    "model": "qwen3.5:4b",
     "prompt": "You are a solver. Look at the image and give ONLY the answer. Do NOT describe the image. If there are math problems — solve them and write the answers. If there is a question — answer it. If there is a task or exercise — complete it. Reply in the language of the text on the image. Be short."
 }
 
@@ -129,6 +130,85 @@ def set_autostart(enable):
         winreg.CloseKey(key)
     except Exception as e:
         print(f"Autostart error: {e}")
+
+
+# ── Hotkey capture widget ─────────────────────────────────────────
+
+class HotkeyEdit(QLineEdit):
+    """A line edit that captures key combinations by pressing them."""
+
+    KEY_MAP = {
+        Qt.Key_Control: "ctrl", Qt.Key_Shift: "shift",
+        Qt.Key_Alt: "alt", Qt.Key_Meta: "win",
+        Qt.Key_Tab: "tab", Qt.Key_Return: "enter",
+        Qt.Key_Enter: "enter", Qt.Key_Backspace: "backspace",
+        Qt.Key_Delete: "delete", Qt.Key_Escape: "esc",
+        Qt.Key_Space: "space", Qt.Key_Up: "up",
+        Qt.Key_Down: "down", Qt.Key_Left: "left",
+        Qt.Key_Right: "right", Qt.Key_Home: "home",
+        Qt.Key_End: "end", Qt.Key_PageUp: "page up",
+        Qt.Key_PageDown: "page down", Qt.Key_Insert: "insert",
+        Qt.Key_F1: "f1", Qt.Key_F2: "f2", Qt.Key_F3: "f3",
+        Qt.Key_F4: "f4", Qt.Key_F5: "f5", Qt.Key_F6: "f6",
+        Qt.Key_F7: "f7", Qt.Key_F8: "f8", Qt.Key_F9: "f9",
+        Qt.Key_F10: "f10", Qt.Key_F11: "f11", Qt.Key_F12: "f12",
+        Qt.Key_BracketLeft: "[", Qt.Key_BracketRight: "]",
+        Qt.Key_Semicolon: ";", Qt.Key_Apostrophe: "'",
+        Qt.Key_Comma: ",", Qt.Key_Period: ".",
+        Qt.Key_Slash: "/", Qt.Key_Backslash: "\\",
+        Qt.Key_Minus: "-", Qt.Key_Equal: "=",
+        Qt.Key_QuoteLeft: "`",
+    }
+
+    def __init__(self, text="", parent=None):
+        super().__init__(text, parent)
+        self.setReadOnly(True)
+        self.setPlaceholderText("Click and press keys...")
+        self._recording = False
+
+    def mousePressEvent(self, event):
+        self._recording = True
+        self.setPlaceholderText("Press hotkey combo...")
+        self.setText("")
+        self.setStyleSheet(self.styleSheet())  # refresh
+        super().mousePressEvent(event)
+
+    def keyPressEvent(self, event):
+        if not self._recording:
+            return
+
+        key = event.key()
+        # ignore lone modifier presses
+        if key in (Qt.Key_Control, Qt.Key_Shift, Qt.Key_Alt, Qt.Key_Meta):
+            return
+
+        parts = []
+        mods = event.modifiers()
+        if mods & Qt.ControlModifier:
+            parts.append("ctrl")
+        if mods & Qt.AltModifier:
+            parts.append("alt")
+        if mods & Qt.ShiftModifier:
+            parts.append("shift")
+        if mods & Qt.MetaModifier:
+            parts.append("win")
+
+        if key in self.KEY_MAP:
+            parts.append(self.KEY_MAP[key])
+        elif 0x20 <= key <= 0x7e:
+            parts.append(chr(key).lower())
+        else:
+            parts.append(f"key{key}")
+
+        combo = "+".join(parts)
+        self.setText(combo)
+        self._recording = False
+        self.setPlaceholderText("Click and press keys...")
+        self.clearFocus()
+
+    def focusOutEvent(self, event):
+        self._recording = False
+        super().focusOutEvent(event)
 
 
 # ── Screenshot selection overlay ──────────────────────────────────
@@ -271,8 +351,19 @@ class ResultOverlay(QWidget):
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setFocusPolicy(Qt.StrongFocus)
 
+        self._drag_pos = None
+        self._handle_height = 40
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        # drag handle bar
+        self._handle = QWidget()
+        self._handle.setFixedHeight(self._handle_height)
+        self._handle.setCursor(Qt.OpenHandCursor)
+        self._handle.setStyleSheet("background: transparent;")
+        layout.addWidget(self._handle)
 
         self._text = QTextEdit()
         self._text.setReadOnly(True)
@@ -281,7 +372,7 @@ class ResultOverlay(QWidget):
                 background-color: transparent;
                 color: #ffffff;
                 border: none;
-                padding: 16px;
+                padding: 4px 12px 12px 12px;
                 font-size: 14px;
                 font-family: 'Segoe UI', sans-serif;
                 selection-background-color: rgba(100, 180, 255, 100);
@@ -304,41 +395,75 @@ class ResultOverlay(QWidget):
 
         self._esc_hook = None
 
+    def _apply_acrylic(self):
+        hwnd = int(self.winId())
+        # nearly clear frosted glass — page clearly visible through blur
+        # format AABBGGRR: alpha=0x15 (~8%), very light tint
+        enable_acrylic(hwnd, 0x15151015)
+
+    def _update_mask(self):
+        """Round the window corners by clipping with a mask."""
+        from PyQt5.QtGui import QRegion, QBitmap
+        path = QPainterPath()
+        path.addRoundedRect(0, 0, self.width(), self.height(), 12, 12)
+        bmp = QBitmap(self.size())
+        bmp.fill(Qt.color0)
+        p = QPainter(bmp)
+        p.setBrush(Qt.color1)
+        p.setPen(Qt.NoPen)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.drawPath(path)
+        p.end()
+        self.setMask(bmp)
+
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
 
-        # fallback glass background
-        path = QPainterPath()
-        path.addRoundedRect(0, 0, self.width(), self.height(), 12, 12)
-        painter.setClipPath(path)
-
-        painter.setBrush(QColor(20, 20, 35, 180))
-        painter.setPen(Qt.NoPen)
-        painter.drawRoundedRect(self.rect(), 12, 12)
-
-        # subtle border
-        pen = QPen(QColor(255, 255, 255, 40), 1)
+        # subtle border only — acrylic does the background
+        pen = QPen(QColor(255, 255, 255, 30), 1)
         painter.setPen(pen)
         painter.setBrush(Qt.NoBrush)
         painter.drawRoundedRect(1, 1, self.width() - 2, self.height() - 2, 12, 12)
 
-        # top highlight line
-        grad = QLinearGradient(0, 0, self.width(), 0)
-        grad.setColorAt(0, QColor(255, 255, 255, 0))
-        grad.setColorAt(0.5, QColor(255, 255, 255, 30))
-        grad.setColorAt(1, QColor(255, 255, 255, 0))
-        painter.setPen(QPen(QBrush(grad), 1))
-        painter.drawLine(20, 1, self.width() - 20, 1)
+        # drag handle grip dots
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(255, 255, 255, 70))
+        grip_y = self._handle_height // 2
+        grip_w = 40
+        grip_x = (self.width() - grip_w) // 2
+        painter.drawRoundedRect(grip_x, grip_y - 2, grip_w, 4, 2, 2)
 
         painter.end()
 
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._update_mask()
+
     def showEvent(self, event):
         super().showEvent(event)
-        # enable acrylic blur via Windows API
-        hwnd = int(self.winId())
-        # AABBGGRR: semi-transparent dark blue-ish
-        enable_acrylic(hwnd, 0xB01a1a2e)
+        self._update_mask()
+        QTimer.singleShot(10, self._apply_acrylic)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton and event.pos().y() <= self._handle_height:
+            self._drag_pos = event.globalPos() - self.frameGeometry().topLeft()
+            self._handle.setCursor(Qt.ClosedHandCursor)
+            event.accept()
+        else:
+            super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._drag_pos is not None and event.buttons() & Qt.LeftButton:
+            self.move(event.globalPos() - self._drag_pos)
+            event.accept()
+        else:
+            super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._drag_pos = None
+        self._handle.setCursor(Qt.OpenHandCursor)
+        super().mouseReleaseEvent(event)
 
     def _hook_escape(self):
         self._unhook_escape()
@@ -354,13 +479,35 @@ class ResultOverlay(QWidget):
         self.hide()
         self.closed.emit()
 
+    def _position_rect(self, rect, min_w, min_h):
+        """Position overlay to the right of the screenshot rect."""
+        screen = QApplication.primaryScreen().geometry()
+        gap = 12
+        w = max(min_w, 340)
+        h = max(min_h, rect.height())
+
+        # try right side
+        x = rect.right() + gap
+        y = rect.top()
+
+        # if it goes off screen right, try left side
+        if x + w > screen.right():
+            x = rect.left() - w - gap
+
+        # if still off screen, fallback to overlapping
+        if x < screen.left():
+            x = rect.left()
+
+        # clamp vertically
+        if y + h > screen.bottom():
+            y = screen.bottom() - h
+        if y < screen.top():
+            y = screen.top()
+
+        return QRect(x, y, w, h)
+
     def show_result(self, rect: QRect, text: str):
-        min_w, min_h = 320, 120
-        r = QRect(rect)
-        if r.width() < min_w:
-            r.setWidth(min_w)
-        if r.height() < min_h:
-            r.setHeight(min_h)
+        r = self._position_rect(rect, 320, 120)
         self.setGeometry(r)
         self._text.setText(text)
         self.show()
@@ -369,12 +516,7 @@ class ResultOverlay(QWidget):
         self._hook_escape()
 
     def show_loading(self, rect: QRect):
-        min_w, min_h = 260, 80
-        r = QRect(rect)
-        if r.width() < min_w:
-            r.setWidth(min_w)
-        if r.height() < min_h:
-            r.setHeight(min_h)
+        r = self._position_rect(rect, 260, 80)
         self.setGeometry(r)
         self._text.setAlignment(Qt.AlignCenter)
         self._text.setText("Analyzing...")
@@ -537,14 +679,14 @@ class SettingsWindow(QMainWindow):
         super().__init__()
         self.config = config
         self.setWindowTitle(f"{APP_NAME}")
-        self.setFixedSize(480, 520)
+        self.setFixedSize(480, 640)
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowMaximizeButtonHint)
         self.setStyleSheet(SETTINGS_STYLE)
 
         central = QWidget()
         self.setCentralWidget(central)
         main_layout = QVBoxLayout(central)
-        main_layout.setSpacing(6)
+        main_layout.setSpacing(4)
         main_layout.setContentsMargins(28, 24, 28, 24)
 
         # ── Header ──
@@ -556,41 +698,53 @@ class SettingsWindow(QMainWindow):
         subtitle.setObjectName("subtitle")
         main_layout.addWidget(subtitle)
 
-        main_layout.addSpacing(16)
+        main_layout.addSpacing(20)
+
+        # ── Base URL ──
+        main_layout.addWidget(self._section_label("BASE URL"))
+        main_layout.addSpacing(4)
+        self.base_url_input = QLineEdit(self.config.get("base_url", DEFAULT_CONFIG["base_url"]))
+        self.base_url_input.setPlaceholderText("http://localhost:11434/v1")
+        main_layout.addWidget(self.base_url_input)
+
+        main_layout.addSpacing(14)
 
         # ── API Key ──
-        main_layout.addWidget(self._section_label("API KEY"))
+        main_layout.addWidget(self._section_label("API KEY (optional for Ollama)"))
+        main_layout.addSpacing(4)
         self.api_key_input = QLineEdit(self.config.get("api_key", ""))
-        self.api_key_input.setEchoMode(QLineEdit.Password)
-        self.api_key_input.setPlaceholderText("gsk_...")
+        self.api_key_input.setPlaceholderText("ollama")
         main_layout.addWidget(self.api_key_input)
 
-        main_layout.addSpacing(10)
+        main_layout.addSpacing(14)
 
         # ── Model ──
         main_layout.addWidget(self._section_label("MODEL"))
+        main_layout.addSpacing(4)
         self.model_input = QLineEdit(self.config.get("model", DEFAULT_CONFIG["model"]))
-        self.model_input.setPlaceholderText("meta-llama/llama-4-scout-17b-16e-instruct")
+        self.model_input.setPlaceholderText("qwen3.5:4b")
         main_layout.addWidget(self.model_input)
 
-        main_layout.addSpacing(10)
+        main_layout.addSpacing(14)
 
         # ── Prompt ──
         main_layout.addWidget(self._section_label("PROMPT"))
+        main_layout.addSpacing(4)
         self.prompt_input = QTextEdit()
-        self.prompt_input.setFixedHeight(64)
+        self.prompt_input.setFixedHeight(68)
         self.prompt_input.setText(self.config.get("prompt", DEFAULT_CONFIG["prompt"]))
         main_layout.addWidget(self.prompt_input)
 
-        main_layout.addSpacing(10)
+        main_layout.addSpacing(14)
 
         # ── Hotkey ──
         main_layout.addWidget(self._section_label("HOTKEY"))
-        self.hotkey_input = QLineEdit(self.config.get("hotkey", DEFAULT_CONFIG["hotkey"]))
-        self.hotkey_input.setPlaceholderText("ctrl+shift+s")
+        main_layout.addSpacing(4)
+        self.hotkey_input = HotkeyEdit(self.config.get("hotkey", DEFAULT_CONFIG["hotkey"]))
+        self.hotkey_input.setPlaceholderText("Click and press keys...")
         main_layout.addWidget(self.hotkey_input)
 
-        main_layout.addSpacing(12)
+        main_layout.addSpacing(16)
 
         # ── Separator ──
         sep = QFrame()
@@ -598,7 +752,7 @@ class SettingsWindow(QMainWindow):
         sep.setFrameShape(QFrame.HLine)
         main_layout.addWidget(sep)
 
-        main_layout.addSpacing(8)
+        main_layout.addSpacing(12)
 
         # ── Autostart ──
         self.autostart_cb = QCheckBox("  Launch on Windows startup")
@@ -617,17 +771,20 @@ class SettingsWindow(QMainWindow):
 
     def _section_label(self, text):
         lbl = QLabel(text)
+        lbl.setFixedHeight(16)
         lbl.setStyleSheet("""
             color: rgba(255, 255, 255, 0.35);
-            font-size: 11px;
+            font-size: 10px;
             font-weight: 700;
             letter-spacing: 1.5px;
             font-family: 'Segoe UI', sans-serif;
-            margin-bottom: 2px;
+            padding: 0;
+            margin: 0;
         """)
         return lbl
 
     def _save(self):
+        self.config["base_url"] = self.base_url_input.text().strip() or DEFAULT_CONFIG["base_url"]
         self.config["api_key"] = self.api_key_input.text().strip()
         self.config["model"] = self.model_input.text().strip()
         self.config["prompt"] = self.prompt_input.toPlainText().strip()
@@ -639,8 +796,8 @@ class SettingsWindow(QMainWindow):
         save_config(self.config)
         set_autostart(self.config["autostart"])
 
-        if new_hotkey != old_hotkey:
-            self.hotkey_changed.emit(new_hotkey)
+        # always re-register hotkey on save
+        self.hotkey_changed.emit(new_hotkey)
 
         self.config_saved.emit(self.config)
         self.hide()
@@ -737,12 +894,15 @@ class AIAnswerApp(QApplication):
         self._settings.raise_()
 
     def _register_hotkey(self, hotkey):
+        if not hotkey:
+            return
         try:
             keyboard.unhook_all_hotkeys()
         except Exception:
             pass
         try:
-            keyboard.add_hotkey(hotkey, self._on_hotkey_pressed, suppress=True)
+            keyboard.add_hotkey(hotkey, self._on_hotkey_pressed)
+            print(f"Hotkey registered: {hotkey}")
         except Exception as e:
             print(f"Hotkey registration error: {e}")
 
@@ -774,11 +934,9 @@ class AIAnswerApp(QApplication):
 
     def _call_groq(self, rect, b64_image):
         try:
-            api_key = self.config.get("api_key", "")
-            if not api_key:
-                self._groq_result.emit(rect, "Error: API key not set. Open Settings and enter your Groq API key.")
-                return
-            client = Groq(api_key=api_key, timeout=30.0)
+            api_key = self.config.get("api_key", "") or "ollama"
+            base_url = self.config.get("base_url", DEFAULT_CONFIG["base_url"])
+            client = OpenAI(api_key=api_key, base_url=base_url, timeout=60.0)
             completion = client.chat.completions.create(
                 model=self.config.get("model", DEFAULT_CONFIG["model"]),
                 messages=[
@@ -799,7 +957,7 @@ class AIAnswerApp(QApplication):
                     }
                 ],
                 temperature=0.5,
-                max_completion_tokens=1024,
+                max_tokens=1024,
             )
             answer = completion.choices[0].message.content
         except Exception as e:
