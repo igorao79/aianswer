@@ -13,7 +13,7 @@ from PyQt5.QtWidgets import (
     QLabel, QLineEdit, QPushButton, QCheckBox, QSystemTrayIcon,
     QMenu, QAction, QMessageBox, QGroupBox, QKeySequenceEdit,
     QTextEdit, QGraphicsDropShadowEffect, QSpacerItem, QSizePolicy,
-    QFrame
+    QFrame, QButtonGroup
 )
 from PyQt5.QtCore import Qt, QRect, pyqtSignal, QPoint, QTimer, QByteArray, QBuffer, QIODevice, QSize
 from PyQt5.QtGui import (
@@ -32,12 +32,26 @@ APP_NAME = "AI Answer"
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", ""), APP_NAME)
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 
+PROVIDERS = {
+    "groq": {
+        "api_key": "",
+        "base_url": "https://api.groq.com/openai/v1",
+        "model": "meta-llama/llama-4-scout-17b-16e-instruct",
+    },
+    "ollama": {
+        "api_key": "ollama",
+        "base_url": "http://localhost:11434/v1",
+        "model": "gemma3:4b",
+    },
+}
+
 DEFAULT_CONFIG = {
-    "api_key": "ollama",
-    "base_url": "http://localhost:11434/v1",
+    "provider": "groq",
+    "api_key": "",
+    "base_url": PROVIDERS["groq"]["base_url"],
     "hotkey": "ctrl+shift+s",
     "autostart": False,
-    "model": "qwen3.5:4b",
+    "model": PROVIDERS["groq"]["model"],
     "prompt": "You are a solver. Look at the image and give ONLY the answer. Do NOT describe the image. If there are math problems — solve them and write the answers. If there is a question — answer it. If there is a task or exercise — complete it. Reply in the language of the text on the image. Be short."
 }
 
@@ -643,6 +657,27 @@ QFrame#card {
     border: 1px solid rgba(255, 255, 255, 0.06);
     border-radius: 12px;
 }
+
+QPushButton#toggle_btn {
+    background-color: rgba(255, 255, 255, 0.06);
+    color: rgba(255, 255, 255, 0.5);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 8px;
+    padding: 10px 20px;
+    font-size: 13px;
+    font-weight: 600;
+    font-family: 'Segoe UI', sans-serif;
+}
+QPushButton#toggle_btn:hover {
+    background-color: rgba(255, 255, 255, 0.1);
+    color: rgba(255, 255, 255, 0.7);
+}
+QPushButton#toggle_btn:checked {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 #667eea, stop:1 #764ba2);
+    color: white;
+    border: none;
+}
 """
 
 TRAY_MENU_STYLE = """
@@ -679,7 +714,7 @@ class SettingsWindow(QMainWindow):
         super().__init__()
         self.config = config
         self.setWindowTitle(f"{APP_NAME}")
-        self.setFixedSize(480, 640)
+        self.setFixedSize(480, 700)
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowMaximizeButtonHint)
         self.setStyleSheet(SETTINGS_STYLE)
 
@@ -700,6 +735,42 @@ class SettingsWindow(QMainWindow):
 
         main_layout.addSpacing(20)
 
+        # ── Provider toggle ──
+        main_layout.addWidget(self._section_label("PROVIDER"))
+        main_layout.addSpacing(4)
+        toggle_layout = QHBoxLayout()
+        toggle_layout.setSpacing(8)
+
+        self.btn_groq = QPushButton("☁  Groq (Cloud)")
+        self.btn_groq.setObjectName("toggle_btn")
+        self.btn_groq.setCheckable(True)
+        self.btn_groq.setCursor(Qt.PointingHandCursor)
+
+        self.btn_ollama = QPushButton("💻  Ollama (Local)")
+        self.btn_ollama.setObjectName("toggle_btn")
+        self.btn_ollama.setCheckable(True)
+        self.btn_ollama.setCursor(Qt.PointingHandCursor)
+
+        self._provider_group = QButtonGroup(self)
+        self._provider_group.setExclusive(True)
+        self._provider_group.addButton(self.btn_groq, 0)
+        self._provider_group.addButton(self.btn_ollama, 1)
+
+        current_provider = self.config.get("provider", "groq")
+        if current_provider == "ollama":
+            self.btn_ollama.setChecked(True)
+        else:
+            self.btn_groq.setChecked(True)
+
+        self.btn_groq.clicked.connect(lambda: self._switch_provider("groq"))
+        self.btn_ollama.clicked.connect(lambda: self._switch_provider("ollama"))
+
+        toggle_layout.addWidget(self.btn_groq)
+        toggle_layout.addWidget(self.btn_ollama)
+        main_layout.addLayout(toggle_layout)
+
+        main_layout.addSpacing(14)
+
         # ── Base URL ──
         main_layout.addWidget(self._section_label("BASE URL"))
         main_layout.addSpacing(4)
@@ -710,10 +781,11 @@ class SettingsWindow(QMainWindow):
         main_layout.addSpacing(14)
 
         # ── API Key ──
-        main_layout.addWidget(self._section_label("API KEY (optional for Ollama)"))
+        main_layout.addWidget(self._section_label("API KEY"))
         main_layout.addSpacing(4)
         self.api_key_input = QLineEdit(self.config.get("api_key", ""))
-        self.api_key_input.setPlaceholderText("ollama")
+        self.api_key_input.setPlaceholderText("API key")
+        self.api_key_input.setEchoMode(QLineEdit.Password)
         main_layout.addWidget(self.api_key_input)
 
         main_layout.addSpacing(14)
@@ -722,7 +794,7 @@ class SettingsWindow(QMainWindow):
         main_layout.addWidget(self._section_label("MODEL"))
         main_layout.addSpacing(4)
         self.model_input = QLineEdit(self.config.get("model", DEFAULT_CONFIG["model"]))
-        self.model_input.setPlaceholderText("qwen3.5:4b")
+        self.model_input.setPlaceholderText("model name")
         main_layout.addWidget(self.model_input)
 
         main_layout.addSpacing(14)
@@ -783,7 +855,14 @@ class SettingsWindow(QMainWindow):
         """)
         return lbl
 
+    def _switch_provider(self, provider):
+        preset = PROVIDERS[provider]
+        self.base_url_input.setText(preset["base_url"])
+        self.api_key_input.setText(preset["api_key"])
+        self.model_input.setText(preset["model"])
+
     def _save(self):
+        self.config["provider"] = "ollama" if self.btn_ollama.isChecked() else "groq"
         self.config["base_url"] = self.base_url_input.text().strip() or DEFAULT_CONFIG["base_url"]
         self.config["api_key"] = self.api_key_input.text().strip()
         self.config["model"] = self.model_input.text().strip()
